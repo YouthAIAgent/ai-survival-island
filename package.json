@@ -2,6 +2,7 @@
   "name": "ai-survival-island",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -10,18 +11,29 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.72.1",
+    "@nomicfoundation/hardhat-chai-matchers": "^2.1.0",
+    "@nomicfoundation/hardhat-ethers": "^4.0.4",
+    "@nomicfoundation/hardhat-ignition-ethers": "^3.0.7",
+    "@nomicfoundation/hardhat-network-helpers": "^3.0.3",
     "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@nomicfoundation/hardhat-verify": "^3.0.9",
     "@openzeppelin/contracts": "^5.4.0",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
+    "@typechain/ethers-v6": "^0.5.1",
+    "@typechain/hardhat": "^9.1.0",
     "@types/three": "^0.182.0",
+    "chai": "^6.2.2",
     "dotenv": "^17.2.3",
     "ethers": "^6.16.0",
     "hardhat": "^3.1.6",
+    "hardhat-gas-reporter": "^2.3.0",
     "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "three": "^0.182.0"
+    "solidity-coverage": "^0.8.17",
+    "three": "^0.182.0",
+    "typechain": "^8.3.2"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
