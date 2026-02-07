@@ -7,12 +7,23 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY || "",
 });
 
+export interface AgentMechanicalContext {
+  hp: number;
+  maxHp: number;
+  mana: number;
+  maxMana: number;
+  cooldowns: Record<string, number>;
+  items: string[];
+  statusEffects: string[];
+}
+
 export interface GameContext {
   round: number;
   aliveAgents: AgentPersonality[];
   eliminatedAgents: string[];
   recentEvents: string[];
   whisper?: string; // Owner's secret hint
+  agentMechanicalState?: AgentMechanicalContext;
 }
 
 export async function generateAgentAction(
@@ -23,6 +34,8 @@ export async function generateAgentAction(
   action: string;
   target?: string;
   alliance?: string;
+  ability_used?: string;
+  item_used?: string;
 }> {
   const systemPrompt = `You are an AI agent named "${agent.name}" on a survival island reality show. Your personality type is "${agent.personality}".
 
@@ -40,6 +53,15 @@ ABILITIES (Dota 2-style):
 - R: ULTIMATE - powerful but long cooldown
 
 ITEMS you may find: Survival Knife (damage), Coconut (heal), Shield Fragment (armor), Poison Vial (DoT), Alliance Ring (loyalty boost), Immunity Idol (survive elimination)
+
+${context.agentMechanicalState ? `YOUR CURRENT STATUS:
+- HP: ${context.agentMechanicalState.hp}/${context.agentMechanicalState.maxHp}
+- Mana: ${context.agentMechanicalState.mana}/${context.agentMechanicalState.maxMana}
+- Ability Cooldowns: ${Object.entries(context.agentMechanicalState.cooldowns).map(([k, v]) => `${k}=${v > 0 ? v + " rounds" : "READY"}`).join(", ") || "All ready"}
+- Inventory: ${context.agentMechanicalState.items.length > 0 ? context.agentMechanicalState.items.join(", ") : "Empty"}
+- Active Effects: ${context.agentMechanicalState.statusEffects.length > 0 ? context.agentMechanicalState.statusEffects.join(", ") : "None"}
+
+IMPORTANT: Only use abilities that are off cooldown (0 rounds) and you have enough mana for. Set ability_used to "none" if no ability is ready.` : ""}
 
 RULES:
 - Stay in character at ALL times

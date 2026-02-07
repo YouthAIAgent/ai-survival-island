@@ -93,6 +93,35 @@ export function areContractsDeployed(): boolean {
   return !!AGENT_NFT_ADDRESS && !!SURVIVAL_ISLAND_ADDRESS;
 }
 
+export async function createGameOnChain(
+  signer: ethers.Signer,
+  maxRounds: number
+): Promise<{ gameId: number; txHash: string } | null> {
+  if (!SURVIVAL_ISLAND_ADDRESS) return null;
+
+  const contract = getSurvivalIslandContract(signer);
+  const tx = await contract.createGame(maxRounds);
+  const receipt = await tx.wait();
+
+  // Parse GameCreated event
+  const iface = new ethers.Interface(SURVIVAL_ISLAND_ABI);
+  for (const log of receipt.logs) {
+    try {
+      const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+      if (parsed && parsed.name === "GameCreated") {
+        return {
+          gameId: Number(parsed.args.gameId),
+          txHash: tx.hash,
+        };
+      }
+    } catch {
+      // Not our event, skip
+    }
+  }
+
+  return { gameId: 0, txHash: tx.hash };
+}
+
 export function getExplorerTxUrl(hash: string): string {
   return `${AVALANCHE_FUJI.blockExplorer}/tx/${hash}`;
 }

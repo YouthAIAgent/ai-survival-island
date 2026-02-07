@@ -29,7 +29,7 @@ export async function POST(request: NextRequest) {
             { status: 400 }
           );
         }
-        const game = await simulateRound(gameId);
+        const game = await simulateRound(gameId, body.mechanicalStates);
         return NextResponse.json({ success: true, game });
       }
 

@@ -21,6 +21,12 @@ export interface GameEvent {
   agentName: string;
   content: string;
   target?: string;
+  abilityUsed?: string;
+  itemUsed?: string;
+}
+
+export interface VoteTally {
+  [agentName: string]: { votes: number; voters: string[] };
 }
 
 export interface GameState {
@@ -33,6 +39,7 @@ export interface GameState {
   events: GameEvent[];
   narration: string;
   winner?: string;
+  voteTally?: VoteTally;
   // Extended Dota 2-style state (optional, managed client-side)
   timeOfDay?: "day" | "night";
   agentStates?: Record<string, unknown>;
@@ -65,7 +72,20 @@ export function getGame(gameId: string): GameState | undefined {
   return activeGames.get(gameId);
 }
 
-export async function simulateRound(gameId: string): Promise<GameState> {
+export interface AgentMechanicalState {
+  hp: number;
+  maxHp: number;
+  mana: number;
+  maxMana: number;
+  cooldowns: Record<string, number>;
+  items: string[];
+  statusEffects: string[];
+}
+
+export async function simulateRound(
+  gameId: string,
+  mechanicalStates?: Record<string, AgentMechanicalState>
+): Promise<GameState> {
   const game = activeGames.get(gameId);
   if (!game) throw new Error("Game not found");
   if (game.status === "ended") throw new Error("Game already ended");
@@ -93,7 +113,10 @@ export async function simulateRound(gameId: string): Promise<GameState> {
   }> = [];
 
   for (const agent of aliveAgents) {
-    const agentContext = { ...context };
+    const agentContext: GameContext = {
+      ...context,
+      agentMechanicalState: mechanicalStates?.[agent.name],
+    };
     const action = await generateAgentAction(agent, agentContext);
 
     game.events.push({
@@ -111,6 +134,8 @@ export async function simulateRound(gameId: string): Promise<GameState> {
       agentName: agent.name,
       content: action.action,
       target: action.target || undefined,
+      abilityUsed: action.ability_used && action.ability_used !== "none" ? action.ability_used : undefined,
+      itemUsed: action.item_used || undefined,
     });
 
     if (action.alliance) {
@@ -175,6 +200,10 @@ export async function simulateRound(gameId: string): Promise<GameState> {
     content: narration,
   });
 
+  // AI agents cast votes based on personality
+  const voteTally = simulateAIVotes(aliveAgents, game.events, game.round);
+  game.voteTally = voteTally;
+
   // Move to voting phase
   game.status = "voting";
 
@@ -214,5 +243,81 @@ export function eliminateAgent(gameId: string, agentName: string): GameState {
 
   activeGames.set(gameId, game);
   return game;
+}
+
+// AI agents vote based on personality traits
+function simulateAIVotes(
+  aliveAgents: AgentPersonality[],
+  events: GameEvent[],
+  round: number
+): VoteTally {
+  const tally: VoteTally = {};
+  for (const agent of aliveAgents) {
+    tally[agent.name] = { votes: 0, voters: [] };
+  }
+
+  for (const voter of aliveAgents) {
+    const candidates = aliveAgents.filter((a) => a.name !== voter.name);
+    if (candidates.length === 0) continue;
+
+    // Score each candidate as a vote target
+    let bestTarget = candidates[0];
+    let bestScore = -Infinity;
+
+    for (const candidate of candidates) {
+      let score = 0;
+
+      // High aggression voters target threats (high strategy agents)
+      score += (voter.aggression / 100) * (candidate.strategy / 100) * 30;
+
+      // Low loyalty voters target everyone more equally; high loyalty protects allies
+      const isAllied = events.some(
+        (e) =>
+          e.type === "alliance" &&
+          e.round >= round - 2 &&
+          ((e.agentName === voter.name && e.target === candidate.name) ||
+            (e.agentName === candidate.name && e.target === voter.name))
+      );
+      if (isAllied) {
+        score -= (voter.loyalty / 100) * 50; // loyal agents avoid voting allies
+      }
+
+      // Agents targeted by a candidate want revenge
+      const wasTargeted = events.some(
+        (e) =>
+          (e.type === "action" || e.type === "betrayal") &&
+          e.agentName === candidate.name &&
+          e.target === voter.name &&
+          e.round >= round - 2
+      );
+      if (wasTargeted) {
+        score += 25;
+      }
+
+      // Betrayers are prime targets
+      const betrayedSomeone = events.some(
+        (e) =>
+          e.type === "betrayal" &&
+          e.agentName === candidate.name &&
+          e.round >= round - 2
+      );
+      if (betrayedSomeone) {
+        score += (voter.strategy / 100) * 20;
+      }
+
+      // Add randomness
+      score += Math.random() * 15;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestTarget = candidate;
+      }
+    }
+
+    tally[bestTarget.name].votes++;
+    tally[bestTarget.name].voters.push(voter.name);
+  }
+
+  return tally;
 }
 

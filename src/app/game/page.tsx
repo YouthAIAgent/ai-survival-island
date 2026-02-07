@@ -1,20 +1,20 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import VotingPanel from "@/components/VotingPanel";
 import ChatBubble from "@/components/ChatBubble";
 import { DEFAULT_AGENTS } from "@/config/agents";
 import { useWeb3 } from "@/contexts/Web3Context";
 import { useTx } from "@/contexts/TxContext";
-import { areContractsDeployed, getSurvivalIslandContract } from "@/lib/contracts";
+import { areContractsDeployed, getSurvivalIslandContract, createGameOnChain } from "@/lib/contracts";
 import TopHeroBar from "@/components/hud/TopHeroBar";
 import BottomHUD from "@/components/hud/BottomHUD";
 import EnhancedMinimap from "@/components/hud/EnhancedMinimap";
 import EnhancedKillFeed from "@/components/hud/EnhancedKillFeed";
 import { initializeExtendedState, processRoundResults } from "@/lib/gameStateManager";
 import type { ExtendedGameState, KillFeedEntry } from "@/types/gameTypes";
-import type { GameEvent as EngineGameEvent } from "@/lib/gameEngine";
+import type { GameEvent as EngineGameEvent, VoteTally } from "@/lib/gameEngine";
 
 const Island3D = dynamic(() => import("@/components/Island3D"), {
   ssr: false,
@@ -40,11 +40,12 @@ const AGENT_HEX: Record<string, string> = {
   Tank: "#3b82f6", Viper: "#22c55e", Nova: "#eab308",
 };
 
-interface GameEvent { timestamp: number; round: number; type: string; agentName: string; content: string; target?: string; }
+interface GameEvent { timestamp: number; round: number; type: string; agentName: string; content: string; target?: string; abilityUsed?: string; itemUsed?: string; }
 interface GameState {
   gameId: string; round: number; status: "waiting" | "active" | "voting" | "ended";
   agents: { name: string; personality: string; charisma: number; strategy: number; loyalty: number; aggression: number; wit: number }[];
   aliveAgentNames: string[]; eliminatedAgentNames: string[]; events: GameEvent[]; narration: string; winner?: string;
+  voteTally?: VoteTally;
 }
 
 export default function GamePage() {
@@ -58,6 +59,23 @@ export default function GamePage() {
   const [showLog, setShowLog] = useState(false);
   const [showWhisper, setShowWhisper] = useState(false);
 
+  // Phase 2: Round summary & vote results
+  const [showRoundSummary, setShowRoundSummary] = useState(false);
+  const [roundSummaryData, setRoundSummaryData] = useState<{ round: number; timeOfDay: string; events: GameEvent[]; narration: string; voteTally?: VoteTally } | null>(null);
+  const [showVoteResults, setShowVoteResults] = useState(false);
+  const [voteResultsData, setVoteResultsData] = useState<{ tally: VoteTally; playerVote: string } | null>(null);
+
+  // Phase 2: Whisper toast & confirm dialog
+  const [whisperToast, setWhisperToast] = useState<string | null>(null);
+  const [showConfirmNewGame, setShowConfirmNewGame] = useState(false);
+
+  // Phase 2: Immunity banner
+  const [immunityBanner, setImmunityBanner] = useState<string | null>(null);
+
+  // Phase 3: On-chain game ID & prize pool
+  const [onChainGameId, setOnChainGameId] = useState<number | null>(null);
+  const [prizePool, setPrizePool] = useState<string | null>(null);
+
   // Web3
   const { isConnected, signer } = useWeb3();
   const { addTx } = useTx();
@@ -68,6 +86,9 @@ export default function GamePage() {
   const [selectedAgent, setSelectedAgent] = useState<string | null>("Shadow");
   const [killFeedEntries, setKillFeedEntries] = useState<KillFeedEntry[]>([]);
 
+  // Ref for checking if user is typing in an input
+  const isTypingRef = useRef(false);
+
   useEffect(() => {
     if (!loading) return;
     const texts = ["AI Agents Thinking", "Agents Scheming", "Forming Alliances", "Plotting Betrayals", "Drama Unfolding"];
@@ -75,6 +96,40 @@ export default function GamePage() {
     const interval = setInterval(() => { i = (i + 1) % texts.length; setLoadingText(texts[i]); }, 2000);
     return () => clearInterval(interval);
   }, [loading]);
+
+  // Phase 2: Keyboard shortcuts
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      // Skip when typing in input fields
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+      switch (e.key.toLowerCase()) {
+        case "q":
+          setShowLog((prev) => !prev);
+          break;
+        case "w":
+          setShowWhisper((prev) => !prev);
+          break;
+        case " ":
+          e.preventDefault();
+          if (game && !loading && game.status === "active") {
+            simulateRoundAction();
+          }
+          break;
+        case "escape":
+          setShowLog(false);
+          setShowWhisper(false);
+          setShowRoundSummary(false);
+          setShowVoteResults(false);
+          setShowConfirmNewGame(false);
+          break;
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [game, loading]);
 
   const apiCall = useCallback(async (body: Record<string, unknown>) => {
     const res = await fetch("/api/ai", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -84,7 +139,16 @@ export default function GamePage() {
   }, []);
 
   async function startNewGame() {
+    // Phase 2: Confirm dialog if game is active
+    if (game && game.status !== "ended" && !showConfirmNewGame) {
+      setShowConfirmNewGame(true);
+      return;
+    }
+    setShowConfirmNewGame(false);
+
     setLoading(true); setHasVoted(false); setShowLog(false);
+    setShowRoundSummary(false); setShowVoteResults(false);
+    setOnChainGameId(null); setPrizePool(null);
     try {
       const g = await apiCall({ action: "create_game", gameId: `game_${Date.now()}`, agents: DEFAULT_AGENTS });
       setGame(g);
@@ -92,36 +156,105 @@ export default function GamePage() {
       setExtendedState(ext);
       setKillFeedEntries([]);
       setSelectedAgent("Shadow");
+
+      // Phase 3: Attempt on-chain game creation
+      if (contractsDeployed && isConnected && signer) {
+        try {
+          const result = await createGameOnChain(signer, 10);
+          if (result) {
+            setOnChainGameId(result.gameId);
+            addTx(result.txHash, "Creating game on-chain...");
+            // Fetch prize pool
+            try {
+              const contract = getSurvivalIslandContract(signer);
+              const gameData = await contract.games(result.gameId);
+              setPrizePool(gameData.prizePool ? (Number(gameData.prizePool) / 1e18).toFixed(3) : null);
+            } catch { /* prize pool query failed */ }
+          }
+        } catch { /* on-chain creation failed, continue off-chain */ }
+      }
     } catch (err: any) { alert("Error: " + err.message); }
     setLoading(false);
   }
 
-  async function simulateRound() {
+  // Build mechanical states for Claude prompt
+  function buildMechanicalStates(): Record<string, unknown> | undefined {
+    if (!extendedState) return undefined;
+    const states: Record<string, unknown> = {};
+    for (const [name, state] of Object.entries(extendedState.agentStates)) {
+      if (!state.isAlive) continue;
+      const cooldowns: Record<string, number> = {};
+      for (const ability of state.abilities) {
+        cooldowns[ability.key] = ability.currentCooldown;
+      }
+      states[name] = {
+        hp: state.hp,
+        maxHp: state.maxHp,
+        mana: state.mana,
+        maxMana: state.maxMana,
+        cooldowns,
+        items: state.items.map((i) => i.name),
+        statusEffects: state.statusEffects.map((se) => se.name),
+      };
+    }
+    return states;
+  }
+
+  async function simulateRoundAction() {
     if (!game || !extendedState) return;
     setLoading(true); setHasVoted(false);
+    setShowRoundSummary(false); setShowVoteResults(false);
     try {
-      const g = await apiCall({ action: "simulate_round", gameId: game.gameId });
+      const mechanicalStates = buildMechanicalStates();
+      const g = await apiCall({ action: "simulate_round", gameId: game.gameId, mechanicalStates });
       setGame(g);
       const roundEvents = g.events.filter((e) => e.round === g.round) as unknown as EngineGameEvent[];
       const { state: newState, killFeed } = processRoundResults(extendedState, roundEvents, g.aliveAgentNames, g.eliminatedAgentNames);
       setExtendedState(newState);
       setKillFeedEntries((prev) => [...prev, ...killFeed]);
+
+      // Phase 2: Show round summary instead of jumping to vote
+      setRoundSummaryData({
+        round: g.round,
+        timeOfDay: newState.timeOfDay,
+        events: g.events.filter((e) => e.round === g.round),
+        narration: g.narration,
+        voteTally: g.voteTally,
+      });
+      setShowRoundSummary(true);
     } catch (err: any) { alert("Error: " + err.message); }
     setLoading(false);
   }
 
   async function handleVote(agentName: string) {
     if (!game || !extendedState) return;
+
+    // Phase 1: Immunity check
+    const targetState = extendedState.agentStates[agentName];
+    if (targetState) {
+      const immunityIdx = targetState.statusEffects.findIndex((se) => se.id === "immunity");
+      if (immunityIdx >= 0) {
+        // Remove immunity buff
+        targetState.statusEffects.splice(immunityIdx, 1);
+        setImmunityBanner(agentName);
+        setTimeout(() => setImmunityBanner(null), 4000);
+        // Skip elimination
+        setHasVoted(true);
+        setVotedFor(undefined);
+        return;
+      }
+    }
+
     setLoading(true);
     setOnChainVoted(false);
 
-    // Attempt on-chain vote (non-blocking — failure doesn't stop gameplay)
+    // Attempt on-chain vote (non-blocking)
     if (contractsDeployed && isConnected && signer) {
       try {
         const contract = getSurvivalIslandContract(signer);
         const agentIndex = game.agents.findIndex((a) => a.name === agentName);
         if (agentIndex >= 0) {
-          const tx = await contract.vote(0, agentIndex);
+          const tx = await contract.vote(onChainGameId ?? 0, agentIndex);
           addTx(tx.hash, `Voting to eliminate ${agentName}...`);
           setOnChainVoted(true);
         }
@@ -135,6 +268,19 @@ export default function GamePage() {
       setGame(g);
       setHasVoted(true);
       setVotedFor(agentName);
+
+      // Phase 2: Show vote results overlay
+      if (game.voteTally) {
+        // Add player vote to tally
+        const tally = { ...game.voteTally };
+        if (tally[agentName]) {
+          tally[agentName] = { votes: tally[agentName].votes + 1, voters: [...tally[agentName].voters, "You"] };
+        }
+        setVoteResultsData({ tally, playerVote: agentName });
+        setShowVoteResults(true);
+        setTimeout(() => setShowVoteResults(false), 4000);
+      }
+
       const roundEvents = g.events.filter((e) => e.round === g.round) as unknown as EngineGameEvent[];
       const { state: newState, killFeed } = processRoundResults(extendedState, roundEvents, g.aliveAgentNames, g.eliminatedAgentNames);
       setExtendedState(newState);
@@ -154,14 +300,16 @@ export default function GamePage() {
         const contract = getSurvivalIslandContract(signer);
         const agentIndex = game.agents.findIndex((a) => a.name === myAgent);
         if (agentIndex >= 0) {
-          const tx = await contract.whisper(0, agentIndex, message);
+          const tx = await contract.whisper(onChainGameId ?? 0, agentIndex, message);
           addTx(tx.hash, `Whispering to ${myAgent}...`);
         }
       } catch {
         // On-chain whisper failed — continue with off-chain
       }
     }
-    alert(`Whisper sent to ${myAgent}: "${message}"\nYour agent will use this hint next round.`);
+    // Phase 2: Toast instead of alert()
+    setWhisperToast(`Whisper sent to ${myAgent}`);
+    setTimeout(() => setWhisperToast(null), 3000);
     setShowWhisper(false);
   }
 
@@ -383,11 +531,24 @@ export default function GamePage() {
         </div>
       )}
 
+      {/* ===== PRIZE POOL BADGE ===== */}
+      {prizePool && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-10">
+          <div className="px-3 py-1 flex items-center gap-2" style={{
+            background: "rgba(0,255,136,0.08)",
+            border: "1px solid rgba(0,255,136,0.2)",
+            clipPath: "polygon(8px 0, calc(100% - 8px) 0, 100% 50%, calc(100% - 8px) 100%, 8px 100%, 0 50%)",
+          }}>
+            <span className="text-[9px] font-black tracking-wider text-green-400">{prizePool} AVAX PRIZE POOL</span>
+          </div>
+        </div>
+      )}
+
       {/* ===== LEFT: TOGGLE BUTTONS ===== */}
       <div className="absolute left-3 top-20 z-10 flex flex-col gap-1.5">
         {[
-          { key: "log", active: showLog, toggle: () => setShowLog(!showLog), label: "LOG", color: "255,42,42", icon: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" },
-          { key: "whisper", active: showWhisper, toggle: () => setShowWhisper(!showWhisper), label: "COMM", color: "180,74,255", icon: "M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" },
+          { key: "log", active: showLog, toggle: () => setShowLog(!showLog), label: "LOG [Q]", color: "255,42,42", icon: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" },
+          { key: "whisper", active: showWhisper, toggle: () => setShowWhisper(!showWhisper), label: "COMM [W]", color: "180,74,255", icon: "M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" },
         ].map((btn) => (
           <button
             key={btn.key}
@@ -497,7 +658,7 @@ export default function GamePage() {
       <div className="absolute bottom-3 left-3 right-3 z-10">
         <BottomHUD
           agent={selectedAgentState}
-          onSimulateRound={simulateRound}
+          onSimulateRound={simulateRoundAction}
           onStartNewGame={startNewGame}
           loading={loading}
           loadingText={loadingText}
@@ -525,7 +686,7 @@ export default function GamePage() {
       </div>
 
       {/* ===== CAMERA CONTROLS ===== */}
-      <div className="absolute bottom-24 right-3 z-10">
+      <div className="absolute bottom-24 right-3 z-10 hidden md:block">
         <div
           className="px-2.5 py-2 space-y-0.5"
           style={{
@@ -538,6 +699,8 @@ export default function GamePage() {
             { key: "LMB", action: "ROTATE" },
             { key: "SCROLL", action: "ZOOM" },
             { key: "RMB", action: "PAN" },
+            { key: "SPACE", action: "NEXT ROUND" },
+            { key: "ESC", action: "CLOSE" },
           ].map((ctrl) => (
             <div key={ctrl.key} className="flex items-center gap-2 text-[7px]">
               <span
@@ -581,8 +744,119 @@ export default function GamePage() {
         </div>
       )}
 
+      {/* ===== ROUND SUMMARY OVERLAY ===== */}
+      {showRoundSummary && roundSummaryData && !loading && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div
+            className="relative max-w-lg w-full mx-4 max-h-[80vh] overflow-y-auto custom-scrollbar animate-bounce-in"
+            style={{
+              background: "linear-gradient(135deg, rgba(5,5,20,0.97), rgba(10,5,15,0.95))",
+              border: "1px solid rgba(0,240,255,0.2)",
+              clipPath: "polygon(16px 0, calc(100% - 16px) 0, 100% 16px, 100% calc(100% - 16px), calc(100% - 16px) 100%, 16px 100%, 0 calc(100% - 16px), 0 16px)",
+            }}
+          >
+            <div className="absolute top-0 left-[16px] right-[16px] h-px" style={{ background: "linear-gradient(90deg, transparent, rgba(0,240,255,0.6), transparent)" }} />
+
+            <div className="p-6">
+              {/* Header */}
+              <div className="text-center mb-5">
+                <div className="flex items-center justify-center gap-3 mb-2">
+                  <div className="h-px w-10 bg-gradient-to-r from-transparent to-cyan-500/40" />
+                  <span className="text-2xl">{roundSummaryData.timeOfDay === "night" ? "\uD83C\uDF19" : "\u2600\uFE0F"}</span>
+                  <div className="h-px w-10 bg-gradient-to-l from-transparent to-cyan-500/40" />
+                </div>
+                <h2 className="text-2xl font-black tracking-[0.15em] text-white">ROUND {roundSummaryData.round}</h2>
+                <p className="text-[10px] font-bold tracking-[0.2em] uppercase mt-1" style={{ color: roundSummaryData.timeOfDay === "night" ? "rgba(147,130,255,0.6)" : "rgba(255,200,0,0.6)" }}>
+                  {roundSummaryData.timeOfDay === "night" ? "NIGHTFALL" : "DAYBREAK"} REPORT
+                </p>
+              </div>
+
+              {/* Narration */}
+              {roundSummaryData.narration && (
+                <div className="p-3 mb-4" style={{
+                  background: "linear-gradient(135deg, rgba(255,170,0,0.06), rgba(5,5,15,0.8))",
+                  borderLeft: "2px solid rgba(255,170,0,0.4)",
+                }}>
+                  <p className="text-[10px] text-yellow-300/80 italic leading-relaxed font-medium">{roundSummaryData.narration}</p>
+                </div>
+              )}
+
+              {/* Events */}
+              <div className="space-y-2 mb-5">
+                {roundSummaryData.events
+                  .filter((e) => e.type !== "narration")
+                  .map((event, i) => {
+                    const typeLabels: Record<string, { label: string; color: string }> = {
+                      dialogue: { label: "SPOKE", color: "#60a5fa" },
+                      action: { label: "ACTION", color: "#a78bfa" },
+                      alliance: { label: "ALLIED", color: "#4ade80" },
+                      betrayal: { label: "BETRAYED", color: "#f87171" },
+                      conversation: { label: "CHATTED", color: "#818cf8" },
+                      elimination: { label: "ELIMINATED", color: "#ef4444" },
+                    };
+                    const tl = typeLabels[event.type] || { label: "EVENT", color: "#9ca3af" };
+
+                    return (
+                      <div key={i} className="flex items-start gap-2 text-[9px] animate-fadeIn" style={{ animationDelay: `${i * 0.05}s` }}>
+                        <span className="font-black px-1.5 py-0.5 shrink-0" style={{ color: tl.color, background: `${tl.color}10`, border: `1px solid ${tl.color}20` }}>
+                          {tl.label}
+                        </span>
+                        <div>
+                          <span className="font-black" style={{ color: AGENT_HEX[event.agentName] || "#fff" }}>{event.agentName}</span>
+                          {event.target && <span className="text-gray-600"> {"\u25B8"} <span style={{ color: AGENT_HEX[event.target] || "#888" }}>{event.target}</span></span>}
+                          <p className="text-gray-500 mt-0.5">{event.content}</p>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+
+              {/* AI Vote Preview */}
+              {roundSummaryData.voteTally && (
+                <div className="mb-5">
+                  <p className="text-[9px] font-black text-red-400/60 uppercase tracking-[0.2em] mb-2">AI VOTE INTENTIONS</p>
+                  <div className="space-y-1.5">
+                    {Object.entries(roundSummaryData.voteTally)
+                      .sort(([, a], [, b]) => b.votes - a.votes)
+                      .map(([name, data]) => (
+                        <div key={name} className="flex items-center gap-2">
+                          <span className="text-[9px] font-black w-16 shrink-0" style={{ color: AGENT_HEX[name] || "#fff" }}>
+                            {AGENT_EMOJIS[name]} {name}
+                          </span>
+                          <div className="flex-1 h-2 bg-white/5 relative overflow-hidden" style={{ clipPath: "polygon(0 0, calc(100% - 2px) 0, 100% 100%, 2px 100%)" }}>
+                            <div
+                              className="h-full transition-all duration-500"
+                              style={{
+                                width: `${(data.votes / Math.max(1, game.aliveAgentNames.length)) * 100}%`,
+                                background: `linear-gradient(90deg, rgba(255,42,42,0.4), rgba(255,42,42,0.8))`,
+                              }}
+                            />
+                          </div>
+                          <span className="text-[8px] font-mono text-red-400/60 w-4 text-right">{data.votes}</span>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Continue button */}
+              <div className="text-center">
+                <button
+                  onClick={() => setShowRoundSummary(false)}
+                  className="game-btn px-8 py-3 text-white text-sm"
+                  style={{ clipPath: "polygon(14px 0, calc(100% - 14px) 0, 100% 50%, calc(100% - 14px) 100%, 14px 100%, 0 50%)" }}
+                >
+                  <span className="tracking-[0.2em]">{"\u26A0"} CONTINUE TO VOTE</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ===== VOTING MODAL ===== */}
-      {game.status === "voting" && !hasVoted && !loading && (
+      {game.status === "voting" && !hasVoted && !loading && !showRoundSummary && (
         <div className="absolute inset-0 z-30 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
           <div
@@ -618,8 +892,53 @@ export default function GamePage() {
         </div>
       )}
 
+      {/* ===== VOTE RESULTS OVERLAY ===== */}
+      {showVoteResults && voteResultsData && (
+        <div className="absolute top-28 left-1/2 -translate-x-1/2 z-25 w-80 animate-bounce-in">
+          <div
+            className="p-4"
+            style={{
+              background: "linear-gradient(135deg, rgba(15,5,5,0.97), rgba(5,5,20,0.95))",
+              border: "1px solid rgba(255,42,42,0.25)",
+              clipPath: "polygon(10px 0, calc(100% - 10px) 0, 100% 10px, 100% calc(100% - 10px), calc(100% - 10px) 100%, 10px 100%, 0 calc(100% - 10px), 0 10px)",
+            }}
+          >
+            <p className="text-[9px] font-black text-red-400/80 uppercase tracking-[0.2em] mb-2 text-center">VOTE RESULTS</p>
+            <div className="space-y-1.5">
+              {Object.entries(voteResultsData.tally)
+                .sort(([, a], [, b]) => b.votes - a.votes)
+                .map(([name, data]) => (
+                  <div key={name} className="flex items-center gap-2">
+                    <span className="text-[8px] font-black w-14 shrink-0" style={{ color: AGENT_HEX[name] || "#fff" }}>
+                      {AGENT_EMOJIS[name]} {name}
+                    </span>
+                    <div className="flex-1 h-2 bg-white/5 relative overflow-hidden">
+                      <div
+                        className="h-full transition-all duration-700"
+                        style={{
+                          width: `${(data.votes / Math.max(1, Object.values(voteResultsData.tally).reduce((s, d) => s + d.votes, 0))) * 100}%`,
+                          background: name === voteResultsData.playerVote
+                            ? "linear-gradient(90deg, rgba(0,240,255,0.5), rgba(0,240,255,0.9))"
+                            : "linear-gradient(90deg, rgba(255,42,42,0.4), rgba(255,42,42,0.7))",
+                        }}
+                      />
+                    </div>
+                    <span className="text-[8px] font-mono text-gray-500 w-3 text-right">{data.votes}</span>
+                    {data.voters.includes("You") && (
+                      <span className="text-[7px] font-black text-cyan-400 bg-cyan-500/10 px-1 rounded">YOU</span>
+                    )}
+                    {onChainVoted && data.voters.includes("You") && (
+                      <span className="text-[6px] font-black text-cyan-400 bg-cyan-500/10 border border-cyan-500/20 px-1 rounded">ON-CHAIN</span>
+                    )}
+                  </div>
+                ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ===== VOTE CONFIRMED BANNER ===== */}
-      {hasVoted && votedFor && (
+      {hasVoted && votedFor && !showVoteResults && (
         <div className="absolute top-20 left-1/2 -translate-x-1/2 z-20 animate-slide-up">
           <div
             className="px-6 py-2.5 flex items-center gap-3"
@@ -639,6 +958,87 @@ export default function GamePage() {
               </span>
             )}
             <span className="text-red-500 text-sm">{"\u2620\uFE0F"}</span>
+          </div>
+        </div>
+      )}
+
+      {/* ===== IMMUNITY IDOL BANNER ===== */}
+      {immunityBanner && (
+        <div className="absolute top-20 left-1/2 -translate-x-1/2 z-30 animate-bounce-in">
+          <div
+            className="px-8 py-4 text-center"
+            style={{
+              background: "linear-gradient(135deg, rgba(245,158,11,0.15), rgba(5,5,15,0.95), rgba(245,158,11,0.15))",
+              border: "1px solid rgba(245,158,11,0.4)",
+              clipPath: "polygon(16px 0, calc(100% - 16px) 0, 100% 50%, calc(100% - 16px) 100%, 16px 100%, 0 50%)",
+            }}
+          >
+            <div className="text-3xl mb-1">{"\uD83D\uDDFF"}</div>
+            <p className="text-sm font-black tracking-[0.2em] text-yellow-400">IMMUNITY IDOL PLAYED!</p>
+            <p className="text-[9px] font-bold tracking-wider text-yellow-400/60 mt-1">
+              {AGENT_EMOJIS[immunityBanner]} {immunityBanner.toUpperCase()} CANNOT BE ELIMINATED
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ===== WHISPER TOAST ===== */}
+      {whisperToast && (
+        <div className="absolute top-20 left-1/2 -translate-x-1/2 z-20 animate-slide-up">
+          <div
+            className="px-6 py-2.5 flex items-center gap-3"
+            style={{
+              background: "linear-gradient(90deg, rgba(180,74,255,0.15), rgba(5,5,15,0.95), rgba(180,74,255,0.15))",
+              border: "1px solid rgba(180,74,255,0.3)",
+              clipPath: "polygon(10px 0, calc(100% - 10px) 0, 100% 50%, calc(100% - 10px) 100%, 10px 100%, 0 50%)",
+            }}
+          >
+            <span className="text-purple-400 text-sm">{"\uD83D\uDCAC"}</span>
+            <span className="text-[10px] font-black tracking-[0.15em] text-purple-300">{whisperToast}</span>
+            <span className="text-purple-400 text-sm">{"\uD83D\uDCAC"}</span>
+          </div>
+        </div>
+      )}
+
+      {/* ===== CONFIRM NEW GAME DIALOG ===== */}
+      {showConfirmNewGame && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+          <div
+            className="relative max-w-sm w-full mx-4 animate-bounce-in"
+            style={{
+              background: "linear-gradient(135deg, rgba(15,5,5,0.97), rgba(20,10,5,0.95))",
+              border: "1px solid rgba(255,170,0,0.3)",
+              clipPath: "polygon(12px 0, calc(100% - 12px) 0, 100% 12px, 100% calc(100% - 12px), calc(100% - 12px) 100%, 12px 100%, 0 calc(100% - 12px), 0 12px)",
+            }}
+          >
+            <div className="absolute top-0 left-[12px] right-[12px] h-px" style={{ background: "linear-gradient(90deg, transparent, rgba(255,170,0,0.6), transparent)" }} />
+
+            <div className="p-6 text-center">
+              <div className="text-3xl mb-3">{"\u26A0\uFE0F"}</div>
+              <h3 className="text-lg font-black text-white tracking-wider mb-2">ABANDON GAME?</h3>
+              <p className="text-[10px] text-gray-400 mb-5">Your current game progress will be lost.</p>
+              <div className="flex gap-3 justify-center">
+                <button
+                  onClick={() => setShowConfirmNewGame(false)}
+                  className="px-5 py-2 text-[10px] font-black tracking-wider text-gray-400 hover:text-white transition-colors"
+                  style={{
+                    background: "rgba(255,255,255,0.05)",
+                    border: "1px solid rgba(255,255,255,0.1)",
+                    clipPath: "polygon(8px 0, calc(100% - 8px) 0, 100% 50%, calc(100% - 8px) 100%, 8px 100%, 0 50%)",
+                  }}
+                >
+                  CANCEL
+                </button>
+                <button
+                  onClick={startNewGame}
+                  className="game-btn px-5 py-2 text-[10px] font-black tracking-wider text-white"
+                  style={{ clipPath: "polygon(8px 0, calc(100% - 8px) 0, 100% 50%, calc(100% - 8px) 100%, 8px 100%, 0 50%)" }}
+                >
+                  NEW GAME
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
