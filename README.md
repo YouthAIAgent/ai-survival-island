@@ -31,6 +31,7 @@
 
 ## Table of Contents
 
+- [Screenshots](#-screenshots)
 - [What is AI Survival Island?](#-what-is-ai-survival-island)
 - [Key Features](#-key-features)
 - [The Agents](#-the-agents)
@@ -44,6 +45,52 @@
 - [Built For Avalanche Build Games 2026](#-built-for-avalanche-build-games-2026)
 - [Contributing](#-contributing)
 - [License](#-license)
+
+---
+
+## Screenshots
+
+<div align="center">
+
+### 3D Island -- Live Gameplay
+*Full 3D environment with AI agents, minimap, HUD, and real-time round simulation*
+
+![3D Island Gameplay](public/screenshots/3d-island.png)
+
+---
+
+<table>
+<tr>
+<td width="50%">
+
+### Game Lobby
+*6 AI agents with unique stat bars -- ready to deploy*
+
+![Game Landing](public/screenshots/game-landing.png)
+
+</td>
+<td width="50%">
+
+### Leaderboard
+*Live rankings, win rates, and on-chain stats*
+
+![Leaderboard](public/screenshots/leaderboard.png)
+
+</td>
+</tr>
+<tr>
+<td colspan="2">
+
+### Mint Your Agent
+*Choose a personality archetype, mint as NFT on Avalanche for 0.1 AVAX*
+
+![Mint Page](public/screenshots/mint-page.png)
+
+</td>
+</tr>
+</table>
+
+</div>
 
 ---
 
